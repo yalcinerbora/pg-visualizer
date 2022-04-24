@@ -1,0 +1,133 @@
+#version 430
+/*
+	**Reinhard 2005 Tone Map & Gamma correction Shader**
+
+	File Name	: TonemapAndGamma.comp
+	Author		: Bora Yalciner
+	Description	:
+
+		Partial Implementation of the Paper
+		"Photographic Tone Reproduction for Digital Images"
+		by Reinhard et al. and applies gamma correction.
+
+		Only implemented Equation 1,2 and 4. Only global keys are supported
+		there are no any Gaussian rings to select optimal key per pixel.
+
+		Additionally it applies gamma correction to the image assuming
+		supplied image is in linear space
+*/
+
+// Defines
+#define U_RES layout(location = 0)
+
+#define T_IN_HDR_IMAGE layout(binding = 0)
+
+#define UB_LUM_DATA layout(std140, binding = 0)
+#define UB_TM_PARAMS layout(std140, binding = 1)
+
+#define I_OUT_SDR_IMAGE layout(binding = 0) restrict writeonly
+
+// Textures
+uniform T_IN_HDR_IMAGE sampler2D tInImage;
+// Images
+uniform I_OUT_SDR_IMAGE image2D iSDROut;
+
+// UBOs
+UB_LUM_DATA uniform LuminanceData
+{
+	float maxLum;
+	float avgLum;
+};
+
+UB_TM_PARAMS uniform Parameters
+{
+	bool	    doToneMap;
+	bool	    doGamma;
+	bool	    doKeyAdjust;
+	float	gammaValue;
+	float	burnRatio;
+	float	key;
+};
+
+vec3 RGBToYxy(in vec3 color)
+{
+    // https://en.wikipedia.org/wiki/SRGB
+    // RBG should be in linear space
+    vec3 xyz =  vec3(0.4124f * color.r + 0.3576f * color.g + 0.1805f * color.b,
+			         0.2126f * color.r + 0.7152f * color.g + 0.0722f * color.b,
+				     0.0193f * color.r + 0.1192f * color.g + 0.9505f * color.b);
+
+	// https://www.easyrgb.com/en/math.php
+	// Now XYZ to Yxy
+	float invSum = 1.0f / (xyz.r + xyz.g + xyz.b);
+	return vec3(xyz.g,
+				xyz.r * invSum,
+				xyz.g * invSum);
+}
+
+vec3 YxyToRGB(in vec3 color)
+{
+	// https://www.easyrgb.com/en/math.php
+	// Yxy to XYZ
+	float yy = (color.r / color.b);
+	float x = color.g * yy;
+	float y = color.r;
+	float z = (1 - color.g - color.b) * yy;
+	vec3 xyz = vec3(x, y, z);
+
+    // https://en.wikipedia.org/wiki/SRGB
+    // XYZ to RGB linear
+    return vec3( 3.2410f * xyz.r - 1.5374f * xyz.g - 0.4986f * xyz.b,
+			    -0.9692f * xyz.r + 1.8760f * xyz.g + 0.0416f * xyz.b,
+				 0.0556f * xyz.r - 0.2040f * xyz.g + 1.0567f * xyz.b);
+}
+
+// Uniforms
+U_RES uniform ivec2 resolution;
+
+// Functions
+vec4 TonemapReinhard2005(in vec4 hdrColor)
+{
+	// Fist Convert to Yxy
+	vec3 colorXxy = RGBToYxy(hdrColor.rgb);
+	// Equation 2
+	if(doKeyAdjust)
+		colorXxy.r = (key / avgLum) * colorXxy.r;
+	// Equation 4
+	float oldY = colorXxy.r;
+	float white = maxLum * burnRatio;
+	float whiteSqr = white * white;
+	float newY = oldY * (1 + (oldY / whiteSqr)) / (1 + oldY);
+	colorXxy.r = newY;
+
+	// Convert back
+	return vec4(YxyToRGB(colorXxy), hdrColor.a);
+}
+
+// 16x16 block is always nice
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main(void)
+{
+	// Call logic is per pixel
+	uvec2 globalId = gl_GlobalInvocationID.xy;
+	// Generate pixelIds
+	ivec2 pixId = ivec2(globalId);
+
+	// Skip out of image threads
+	if(any(greaterThanEqual(globalId, resolution))) return;
+
+	// Read from current buffer buffers
+	vec4 hdrColorIn = texelFetch(tInImage, pixId, 0);
+
+	vec4 sdrColorOut;
+	if(doToneMap)
+		sdrColorOut = TonemapReinhard2005(hdrColorIn);
+	else
+		sdrColorOut = hdrColorIn;
+
+	// Check gamma correction
+	if(doGamma)
+		sdrColorOut.rgb = pow(sdrColorOut.rgb, vec3(1.0f/gammaValue));
+
+	imageStore(iSDROut, pixId, sdrColorOut);
+}
